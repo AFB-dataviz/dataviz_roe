@@ -1,0 +1,1267 @@
+---
+title: "Préparation des graphiques"
+author: "Cédric Mondy"
+date: "19/11/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if (!require(pacman)) install.packages("pacman")
+pacman::p_load(tidyverse, purrr, readxl, sf, ggBubbles, plotly, scales, treemap, d3treeR, htmlwidgets, prismatic, eulerr)
+
+wd <- getwd()
+```
+
+# Chargement des données
+
+Les données du ROE sont téléchargées depuis le shapefile zippé depuis (data.eaufrance.fr)[https://services.sandre.eaufrance.fr/geo/obs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&typename=ObstEcoul_FXX&SRSNAME=EPSG:2154&OUTPUTFORMAT=SHAPEZIP] ou (sandre.eaufrance.fr)[http://www.sandre.eaufrance.fr/atlas/srv/fre/catalog.search;jsessionid=uve0qbc851mx1u4fqcwqin49y#/metadata/59057026-b40c-4cf9-9e3e-7296e0aa1a78].
+
+
+```{r}
+date_export <- "2019-11-19"
+
+unzip(zipfile = file.path(wd, "data/raw/ObstEcoul_FXX-shp.zip"),
+      exdir = file.path(wd, "temp"))
+
+data_raw <- st_read(file.path(wd, "temp/ObstEcoul_FXX.shp"),
+                    stringsAsFactors = FALSE) %>%
+  # Ne conserve pas la géométrie
+  st_drop_geometry()                          %>% 
+  as_tibble()                                 %>% 
+  # Ne conserve que les ouvrages validés
+  filter(StObstEcou == "Validé")
+
+system("rm -r temp")
+```
+
+# Préparation des données
+
+## Correspondances entre codes et libellés
+
+```{r}
+typo_ouvrage <- data_raw          %>% 
+  select(code_type  = CdTypeOuvr, 
+         label_type = LbTypeOuvr) %>% 
+  # Simplifie la codification des types d'ouvrages
+  mutate(code_type = case_when(
+    code_type %in% paste0("1.1", c("", ".0", ".X")) ~ "1.1",
+    code_type %in% paste0("1.2", c("", ".0", ".X")) ~ "1.2",
+    code_type %in% paste0("1.3", c("", ".0", ".X")) ~ "1.3",
+    code_type %in% paste0("1.4", c("", ".0", ".X")) ~ "1.4",
+    code_type %in% paste0("1.5", c("", ".0", ".X")) ~ "1.5",
+    code_type %in% paste0("1.6", c("", ".0", ".X")) ~ "1.6",
+    TRUE ~ code_type
+  ),
+  label_type = case_when(
+    code_type %in% paste0("1.1", c("", ".0", ".X")) ~ "Barrage",
+    code_type %in% paste0("1.2", c("", ".0", ".X")) ~ "Seuil en rivière",
+    code_type %in% paste0("1.3", c("", ".0", ".X")) ~ "Digue",
+    code_type %in% paste0("1.4", c("", ".0", ".X")) ~ "Obstacle induit par un pont",
+    code_type %in% paste0("1.5", c("", ".0", ".X")) ~ "Epis en rivière",
+    code_type %in% paste0("1.6", c("", ".0", ".X")) ~ "Grille de pisciculture",
+    TRUE ~ label_type))           %>% 
+  distinct()                      %>% 
+  filter(!is.na(code_type))       %>% 
+  arrange(code_type)              %>% 
+  (function(df) {
+    bind_rows(
+      tibble(code_type = '0', label_type = "Type inconnu"),
+      df
+    )
+  })
+
+typo_chute <- data_raw             %>% 
+  select(code_chute  = CdHautChut, 
+         label_chute = LbHautChut) %>% 
+  distinct()                       %>% 
+  filter(!is.na(code_chute))       %>% 
+  arrange(code_chute)
+
+typo_usage <- data_raw       %>% 
+  (function(df) {
+    bind_rows(
+      select(df, code_usage = CdUsageObs, label_usage = LbUsageObs),
+      select(df, code_usage = CdUsageO_1, label_usage = LbUsageO_1),
+      select(df, code_usage = CdUsageO_2, label_usage = LbUsageO_2),
+      select(df, code_usage = CdUsageO_3, label_usage = LbUsageO_3)
+    )
+  })                         %>% 
+  distinct()                 %>% 
+  filter(!is.na(code_usage)) %>% 
+  arrange(as.numeric(code_usage))
+
+typo_dispo <- data_raw   %>% 
+  (function(df) {
+    bind_rows(
+      select(df, code_dispo = CdTypeDisp, label_dispo = LbTypeDisp),
+      select(df, code_dispo = CdTypeDi_1, label_dispo = LbTypeDi_1),
+      select(df, code_dispo = CdTypeDi_2, label_dispo = LbTypeDi_2),
+      select(df, code_dispo = CdTypeDi_3, label_dispo = LbTypeDi_3),
+      select(df, code_dispo = CdTypeDi_4, label_dispo = LbTypeDi_4)
+    )
+  })                              %>% 
+  distinct()                      %>% 
+  filter(!is.na(code_dispo))      %>% 
+  arrange(as.numeric(code_dispo)) %>% 
+  (function(df) {
+    bind_rows(
+      tibble(code_dispo = '00',
+             label_dispo = "Absence d'information"),
+      df
+    )
+  })
+
+```
+
+## Données des obstacles
+
+```{r}
+data_roe <- data_raw %>% 
+  (function(df) {
+    list(
+      select(df,
+             code_obstacle   = CdObstEcou, 
+             date_validation = DateValidO,
+             code_type       = CdTypeOuvr, 
+             code_chute      = CdHautChut,
+             altitude        = AltiPointC, 
+             dist_mer        = pkObstEcou, 
+             etat_ouvrage    = LbEtOuvrag),
+      # Sélectionne les codes des dispositifs de franchissement pour les
+      # poissons
+      select(df, 
+             code_obstacle = CdObstEcou,
+             contains("CdTypeDi"))               %>% 
+        select(-matches(paste0("CdTypeDi_", 5:7, 
+                               collapse = "|"))) %>% 
+        pivot_longer(cols = starts_with("CdTypeDi"),
+                     names_to = "ordre",
+                     values_to = "code_dispo") %>% 
+        select(code_obstacle, code_dispo) %>% 
+        filter(!is.na(code_dispo)),
+      # Sélectionne les codes des usages
+      select(df, 
+             code_obstacle = CdObstEcou, 
+             contains("CdUsage")) %>% 
+        pivot_longer(cols = starts_with("CdUsage"),
+                     names_to = "ordre",
+                     values_to = "code_usage") %>% 
+        select(code_obstacle, code_usage) %>% 
+        filter(!is.na(code_usage))
+    ) %>% 
+      reduce(left_join, by = "code_obstacle")
+  }) %>% 
+  distinct() %>% 
+  # Simplifie la codification des types d'ouvrages
+  mutate(code_type = case_when(
+    code_type %in% paste0("1.1", c("", ".0", ".X")) ~ "1.1",
+    code_type %in% paste0("1.2", c("", ".0", ".X")) ~ "1.2",
+    code_type %in% paste0("1.3", c("", ".0", ".X")) ~ "1.3",
+    code_type %in% paste0("1.4", c("", ".0", ".X")) ~ "1.4",
+    code_type %in% paste0("1.5", c("", ".0", ".X")) ~ "1.5",
+    code_type %in% paste0("1.6", c("", ".0", ".X")) ~ "1.6",
+    TRUE ~ code_type),
+    code_usage = if_else(is.na(code_usage), "0", code_usage)) %>% 
+  mutate(# Lorsque la date est manquante attribue la première date trouvée dans
+         # le ROE
+         date_validation = if_else(
+           is.na(date_validation),
+           min(date_validation, na.rm = TRUE),
+           date_validation
+           ),
+           # Ajoute des codes '0' à la place des NA pour le type, l'usage, la
+           # classe de hauteur de chute et les dispositifs de franchissement
+         code_type  = if_else(is.na(code_type),  '0',  code_type),
+         code_usage = if_else(is.na(code_usage), '0',  code_usage),
+         code_chute = if_else(is.na(code_chute), '0',  code_chute),
+         code_dispo = if_else(is.na(code_dispo), '00', code_dispo)
+         ) %>% 
+  # Créer le champ type principal en récupérant les 3 premiers caractères du
+  # code type
+  mutate(code_type_principal = 
+           if_else(condition = code_type == '0', 
+                   true      = '0',
+                   false     = str_sub(code_type, start = 1L, end = 3L))) %>% 
+  # Ajoute les libellés
+  left_join(typo_ouvrage, by = "code_type") %>%
+  left_join(rename(typo_ouvrage, 
+                   code_type_principal  = code_type,
+                   label_type_principal = label_type),
+            by = "code_type_principal")    %>%
+  left_join(typo_usage, by = "code_usage") %>% 
+  left_join(typo_chute, by = "code_chute") %>% 
+  left_join(typo_dispo, by = "code_dispo") %>% 
+  # Nettoie les données 
+  group_by(code_obstacle) %>% 
+  group_modify(.f = function(df, ...) {
+    df2 <- df
+    # Si plusieurs types attribués dont 'inconnu', 
+    # enlève le 'inconnu'
+    if (n_distinct(df2$code_type) > 1 & '0' %in% df2$code_type)
+      df2 <- filter(df2, code_type != '0')
+
+    # Si type principal et sous-type renseignés, 
+    # enlève le type principal
+    for (i in c("1.1", "1.2", "1.3", "1.4")) {
+      if (n_distinct(df2$code_type[str_detect(df2$code_type, paste0("^", i))]) > 1 & i %in% df2$code_type)
+        df2 <- filter(df2, code_type != i)
+    }
+
+    # Si plusieurs usages dont inconnu, 
+    # enlève l'inconnu
+    if (n_distinct(df2$code_usage) > 1 & '0' %in% df2$code_usage)
+      df2 <- filter(df2, code_usage != '0')
+    
+    # Si aucun usage et obsolète, 
+    # ne conserve que obsolète
+    if (all(c('12', '14') %in% df2$code_usage))
+      df2 <- filter(df2, code_usage != '12')
+
+    # Si plusieurs usages dont obsolète ou aucun, 
+    # conserve les usages les plus récents (dernières lignes): soit
+    # aucun/obsolète soit usages renseignés plus récents que aucun/obsolète
+    if (n_distinct(df2$code_usage) > 1 & 
+        any(c('12', '14') %in% df2$code_usage)) {
+      
+      df2 <- mutate(df2, id = row_number())
+      
+      if (all(filter(df2, code_usage %in% c('12', '14'))$id > 
+              filter(df2, !code_usage %in% c('12', '14'))$id)) {
+        df2 <- filter(df2, code_usage %in% c('12', '14'))
+      } else {
+        id_unknown <- filter(df2, code_usage %in% c('12', '14'))$id
+        
+        df2 <- filter(df2, id > id_unknown)
+      }
+      
+      df2 <- select(df2, -id)
+    }
+    
+    # Si plusieurs classes de hauteurs de chute dont classe inconnue, 
+    # enlève l'inconnue
+    if (n_distinct(df2$code_chute) > 1 & '0' %in% df2$code_chute)
+      df2 <- filter(df2, code_chute != '0')
+
+    # Si plusieurs dispositifs de franchissement dont absence de passe, 
+    # enlève l'absence de passe
+    if (n_distinct(df2$code_dispo) > 1 & '0' %in% df2$code_dispo)
+      df2 <- filter(df2, code_dispo != '0')
+    # Si plusieurs dispositifs de franchissement dont inconnu, 
+    # enlève l'inconnu
+    if (n_distinct(df2$code_dispo) > 1 & '11' %in% df2$code_dispo)
+      df2 <- filter(df2, code_dispo != '11')
+    
+    
+    return(df2)
+  }) %>% 
+  ungroup()
+
+save(data_roe, typo_ouvrage, typo_usage, typo_chute, typo_dispo,
+     file = file.path(wd, "data/processed/data_roe.rda"))
+```
+
+# Figure 1: Renseignement du ROE
+
+> ouvrages validés
+
+## Préparation des données
+
+```{r}
+data_evol <- data_roe %>% 
+  # Compte le nombre total d'obstacles et le nombre d'obstacles existant par
+  # date de validation
+  group_by(date_validation) %>% 
+  summarise(n_all   = n_distinct(code_obstacle),
+            n_exist = n_distinct(code_obstacle[etat_ouvrage == "Existant"])) %>% 
+  ungroup() %>% 
+  # Fait le cumul des comptes
+  mutate(n_all   = cumsum(n_all),
+         n_exist = cumsum(n_exist)) %>% 
+  # Prépare les labels
+  rename(date = date_validation) %>% 
+  mutate(text_all = paste0("Date: ", date, "<br>Nombre d'obstacles: ", format(n_all, big.mark = " ")),
+         text_exist = paste0("Date: ", date, "<br>Nombre d'obstacles: ", format(n_exist, big.mark = " ")))
+
+last_date <- filter(data_evol, date == max(date))
+
+```
+
+## Figure
+
+```{r}
+data_evol %>% 
+  plot_ly() %>% 
+  add_lines(x = ~date, y = ~n_all, line = list(color = "grey"),
+            text = ~text_all,
+            hoverinfo = "text") %>% 
+  add_lines(x = ~date, y = ~n_exist, line = list(color = "black"),
+            text = ~text_exist,
+            hoverinfo = "text") %>% 
+  add_markers(data = last_date,
+              x = ~date, y = ~n_all, marker = list(color = "grey"),
+              text = ~text_all,
+              hoverinfo = "text") %>% 
+  add_markers(data = last_date,
+              x = ~date, y = ~n_exist, marker = list(color = "black"),
+              text = ~text_exist,
+              hoverinfo = "text") %>% 
+  add_annotations(x = -.05, xref = "paper", xanchor = "left", 
+                  y = 1, yref = "paper", yanchor = "bottom",
+                  text = "<i>Nombre d'obstacles à l'écoulement<br>validés dans le référentiel</i>",
+                  showarrow = FALSE, align = "left") %>% 
+  add_annotations(x = 1, xref = "paper", xanchor = "right",
+                  y = -.05, yref = "paper", yanchor = "top", 
+                  text = "<i>Date de validation</i>", showarrow = FALSE) %>% 
+  add_annotations(x = "2014-01-01", xref = "x", xanchor = "right",
+                  y = 76000, yref = "y", yanchor = "center",
+                  text = "<i>Obstacles existants,<br>(partiellement) détruits<br>ou en projet</i>",
+                  align  = "left",
+                  bgcolor = grey(.5), font = list(color = "white", face = "bold"),
+                  showarrow = FALSE) %>% 
+  add_annotations(x = "2014-01-01", xref = "x", xanchor = "left",
+                  y = 50000, yref = "y", yanchor = "center",
+                  text = "<i>Obstacles existants</i>",
+                  bgcolor = grey(.05), font = list(color = "white", face = "bold"),
+                  showarrow = FALSE, align = "left") %>% 
+  add_annotations(x = last_date$date + 30 , xref = "x", xanchor = "left", 
+                  y = last_date$n_all, yref = "y", yanchor = "center",
+                  text = paste0(format(last_date$n_all, big.mark = " "), " obstacles"),
+                  showarrow = FALSE, font = list(color = "grey")) %>% 
+  add_annotations(x = last_date$date + 30 , xref = "x", xanchor = "left", 
+                  y = last_date$n_exist, yref = "y", yanchor = "center",
+                  text = paste0(format(last_date$n_exist, big.mark = " "), " obstacles"),
+                  showarrow = FALSE) %>% 
+  layout(xaxis = list(title = "",
+                      range = c(min(data_evol$date), as.Date("2020-01-01")),
+                      tickvals = c(2010, 2015, 2020),
+                      tickformat = "%Y",
+                      ticklen = 5,
+                      showgrid = FALSE),
+         yaxis = list(title = "",
+                      tickvals = c(0, 25000, 50000, 75000, 100000),
+                      ticktext = c("0", "25 000", "50 000", "75 000", "100 000")),
+         margin = list(t = 50, b = 50, r = 100),
+         plot_bgcolor = 'transparent',
+         paper_bgcolor = 'transparent') %>% 
+  hide_guides() %>% 
+  api_create(filename = "roe_01_nombre_obstacles")
+```
+
+# Figure 2: Typologie des obstacles
+
+> ouvrages validés
+> ouvrages existants
+
+## Préparation des données
+
+```{r}
+data_typo <- data_roe %>% 
+  filter(etat_ouvrage == "Existant") %>% 
+  group_by(label_type_principal, label_type) %>% 
+  summarise(nombre = n_distinct(code_obstacle)) %>% 
+  group_by(label_type_principal) %>% 
+  mutate(n_type = sum(nombre)) %>%
+  ungroup() %>% 
+  mutate(label_type_principal = fct_reorder(.f = label_type_principal,
+                                            .x = n_type, .desc = FALSE)) %>% 
+  arrange(label_type_principal, desc(nombre)) %>% 
+  # mutate(label_type = fct_relevel(label_type, unique(label_type))) %>% 
+  group_by(label_type_principal) %>%
+  mutate(id_type = as.character(rank(1 / nombre)),
+         hoverLabel = paste0(label_type, " (n = ", nombre, ")")) %>% 
+  rename(`Catégorie` = label_type_principal,
+         `Type`      = label_type,
+         Nombre = nombre) %>% 
+  arrange(Catégorie, desc(Nombre)) %>% 
+  mutate(Type = case_when(
+    Type == Catégorie & 
+      !(Type %in% c("Type inconnu", "Epis en rivière", "Grille de pisciculture")) ~ "non renseigné",
+    Type == "Seuil en rivière déversoir" ~ "Déversoir",
+    Type == "Seuil en rivière enrochements" ~ "Enrochements",
+    Type == "Seuil en rivière radier" ~ "Radier",
+    TRUE ~ Type
+  ))
+
+palette_categorie <- c("#0052A5FF", "#00C5C6FF", "#00E673FF", "#4EEA68FF", "#ACEE9FFF", "#F1F1F1FF", "#404040FF") %>% 
+  color()
+
+names(palette_categorie) <- c("Barrage", "Seuil en rivière", "Obstacle induit par un pont", "Digue", "Epis en rivière", "Grille de pisciculture", "Type inconnu")
+```
+
+## Figure
+
+```{r}
+data_typo %>% 
+  treemap(dtf = ., 
+          index = c("Catégorie", "Type"), 
+          vSize = "Nombre",
+          type = "index", 
+          vColor = "Type",
+          palette = palette_categorie[levels(data_typo$Catégorie)],
+          position.legend = "none", 
+          title = "Types d'obstacles à l'écoulement",
+          aspRatio = 1) %>% 
+  d3tree3(data = .,
+          rootname = "Types d'obstacles à l'écoulement",
+          width = "800px", height = "800px") %>% 
+  as_widget() %>% 
+  saveWidget(file = file.path(wd, "roe_01_types_ouvrages.html"))
+
+# centre la treemap au milieu de la page
+readLines(file.path(wd, "roe_01_types_ouvrages.html"), encoding = "UTF-8") %>% 
+  str_replace(pattern = "class=\"d3tree3 html-widget\" style=\"width:800px;height:800px;\"",
+              replacement = "class=\"d3tree3 html-widget\" style=\"width:95vh;height:95vh;margin-left:auto;margin-right:auto;\"") %>% 
+  str_replace(
+    pattern = "\"width\":\"800px\",\"height\":\"800px\",\"padding\":15,\"fill\":false",
+    replacement = "\"width\":\"95vh\",\"height\":\"95vh\",\"padding\":15,\"fill\":true"
+  ) %>% 
+  str_replace(
+    pattern = "\"width\":\"800px\",\"height\":\"800px\",\"padding\":40,\"fill\":false",
+    replacement = "\"width\":\"95vh\",\"height\":\"95vh\",\"padding\":40,\"fill\":true"
+  ) %>% 
+  writeLines(file.path(wd, "roe_01_types_ouvrages.html"), useBytes = TRUE)
+
+```
+
+# Figure 3: Connaissance des usages
+
+> ouvrages validés
+> ouvrages existants
+> ouvrages de type seuil en rivière, obstacle induit par un pont ou barrage
+
+## Préparation des données
+
+```{r}
+prep_sunburst_data <- function(df, val = NULL, ...) {
+  require(dplyr)
+  require(rlang)
+  require(stringr)
+  
+  v = list(...) %>% 
+    unlist()
+  
+  if (is.null(val)) {
+    df <- mutate(df, values = 1)
+    val  <-  "values"
+  }
+    
+
+  df_prep <- ungroup(df) %>% 
+    rename(values = val) %>% 
+    group_by_at(v) %>% 
+    summarise(values = sum(values)) %>% 
+    ungroup()
+  
+  v_step <- v
+  
+  df_out <- tibble(ids = NA_character_,
+                   labels = NA_character_,
+                   parents = NA_character_,
+                   values = NA_real_) %>% 
+    slice(0)
+  
+  while (length(v_step) > 1) {
+    
+    df_step <- group_by_at(df_prep, v_step) %>% 
+      summarise(values = sum(values)) %>% 
+      ungroup()
+    
+    df_out <- bind_rows(
+      df_step %>% 
+        select_at(v_step) %>% 
+        unite(col = "ids", sep = "->") %>% 
+        bind_cols(select(df_step, values)) %>% 
+        mutate(parents = str_split(ids, "->") %>% 
+                 lapply(FUN = function(x) x[1:length(x) - 1]) %>% 
+                 sapply(FUN = paste, collapse = "->"),
+               labels = str_split(ids, "->") %>% 
+                 sapply(FUN = function(x) x[[length(x)]])
+        ),
+      df_out
+    )
+    
+    v_step <- v_step[seq(length(v_step) - 1)]
+    
+    
+  }
+  
+  if (length(v_step) == 1) {
+      v_step <- v_step[seq(length(v_step) - 1)]
+  
+  df_step <- group_by_at(df_prep, v_step) %>% 
+    summarise(values = sum(values)) %>% 
+    ungroup()
+  
+  bind_rows(
+    summarise(df_step, values = sum(values)) %>% 
+      mutate(parents = NA_character_,
+             labels = "",
+             ids = "_"),
+    df_step %>%
+      rename(labels = v_step) %>% 
+      mutate(ids = labels,
+             parents = "_"),
+    df_out)
+  } else {
+    summarise(df_step, values = sum(values)) %>% 
+      mutate(parents = NA_character_,
+             labels = "",
+             ids = "_")
+  }
+}
+
+```
+
+
+```{r}
+data_sunburst <- data_roe %>% 
+  filter(etat_ouvrage == "Existant",
+         label_type_principal %in% c("Seuil en rivière", "Obstacle induit par un pont", "Barrage")) %>% 
+  mutate(parents = if_else(label_usage == "Type d'usage inconnu",
+                                          "Usage inconnu", "Usage connu"),
+         labels = if_else(is.na(label_type_principal),
+                          "Type inconnu", label_type_principal)) %>%
+  group_by(parents, labels) %>% 
+  summarise(values = n_distinct(code_obstacle)) %>%
+  prep_sunburst_data(val = "values", "parents", "labels") %>% 
+  mutate(labels = if_else(labels == "Obstacle induit par un pont",
+                          "Obstacle induit<br>par un pont",
+                          labels))
+```
+
+## Figure
+
+```{r}
+data_sunburst %>% 
+  plot_ly(data = ., 
+          ids = ~ids,
+          labels = ~labels,
+          parents = ~parents, 
+          values = ~values,
+          branchvalues = "total",
+          type = "sunburst",
+          marker = list(
+            line = list(
+              color = "white",
+              width = 2
+              ),
+            colors = c("white",
+                       grey(c(.25, .8)), 
+                       palette_categorie[c("Barrage", "Obstacle induit par un pont", "Seuil en rivière")],
+                       palette_categorie[c("Barrage", "Obstacle induit par un pont", "Seuil en rivière")] %>% clr_lighten(shift = .75))
+            )) %>% 
+  layout(plot_bgcolor = 'transparent',
+         paper_bgcolor = 'transparent') %>% 
+  api_create("roe_03_usages_connus")
+```
+
+# Figure 4: Usages par type
+
+> ouvrages validés
+> ouvrages existants
+> ouvrages de type seuil en rivière, obstacle induit par un pont ou barrage
+> ouvrages avec un usage connu
+
+## Préparation des données
+
+```{r}
+prep_sankey_data <- function(data, origin, target, ID = NULL, nMin = 0) {
+  require(dplyr)
+  require(forcats)
+  
+  origin <- enquo(origin)
+  target <- enquo(target)
+  ID     <- enquo(ID)
+  
+  if (is.null(ID)) {
+    data$id <- as.character(seq(nrow(data)))
+  } else {
+    data <- rename(data, id = !! ID)
+  }
+  
+  sankey_links <- rename(data,
+                         source = !!origin,
+                         target = !!target) %>% 
+    filter(!is.na(source), !is.na(target))  %>% 
+    group_by(source, target)                %>% 
+    summarise(value = n_distinct(id))       %>% 
+    ungroup()                               %>% 
+    filter(value >= nMin)
+  
+  nodes <- lapply(split(select(sankey_links, source, target),
+                        seq(nrow(sankey_links))),
+                  function(x) {as.vector(t(x))}) %>% 
+    do.call(what = c)
+  
+  sankey_nodes        <- seq(n_distinct(nodes)) - 1
+  names(sankey_nodes) <-  unique(nodes)
+  
+  sankey_links <- mutate(sankey_links,
+                         source = sankey_nodes[source],
+                         target = sankey_nodes[target]) 
+  
+  sankey_nodes <- tibble(id = sankey_nodes, label = names(sankey_nodes)) 
+  
+  list(links = sankey_links, 
+       nodes = sankey_nodes)
+}
+
+```
+
+```{r}
+data_sankey <- data_roe %>% 
+  filter(etat_ouvrage == "Existant",
+         label_type_principal %in% 
+           c("Seuil en rivière", "Obstacle induit par un pont", "Barrage"),
+         label_usage != "Type d'usage inconnu",
+         ) %>% 
+  mutate(label_usage = if_else(label_usage %in% c("Aucun", "Obsolète"),
+                               "Aucun ou Obsolète", label_usage)) %>% 
+  prep_sankey_data(data   = .,
+                   origin = label_type_principal, 
+                   target = label_usage, 
+                   ID     = code_obstacle,
+                   nMin   = 0)
+
+data_sankey$nodes <-
+  mutate(data_sankey$nodes,
+         color = case_when(
+           label == "Barrage" ~ palette_categorie["Barrage"],
+           label == "Obstacle induit par un pont" ~ palette_categorie["Obstacle induit par un pont"],
+           label == "Seuil en rivière" ~ palette_categorie["Seuil en rivière"],
+           label == "Aucun ou Obsolète" ~ grey(.8),
+           TRUE ~ grey(.25)
+           )) %>% 
+  arrange(color) %>% 
+  mutate(id2 = 0:(n() - 1))
+
+data_sankey$links <- 
+  left_join(data_sankey$links, 
+            select(data_sankey$nodes, contains("id")),
+            by = c("source" = "id")) %>% 
+  select(source = id2, target, value) %>% 
+  left_join(select(data_sankey$nodes, contains("id")), 
+            by = c("target" = "id")) %>% 
+  select(source, target = id2, value)
+
+data_sankey$nodes = select(data_sankey$nodes, id = id2, label, color)
+```
+
+## Figure
+
+```{r}
+plot_ly(
+  type = "sankey",
+  domain = list(x = c(0, 1), y = c(0, 1)),
+  orientation = "h", 
+  valueformat = ".0f",
+  node = list(
+    label = data_sankey$nodes$label,
+    color = data_sankey$nodes$color,
+    hovertemplate = "%{label}"
+  ),
+  link = list(
+    source = data_sankey$links$source,
+    target = data_sankey$links$target,
+    value  = data_sankey$links$value
+  ),
+  arrangement = "snap"
+) %>% 
+  layout(plot_bgcolor = 'transparent') %>% 
+  api_create("roe_04_types_usages")
+```
+
+# Figure 5: Hauteurs de chute
+
+> ouvrages validés
+> ouvrages existants
+> ouvrages de type seuil en rivière, obstacle induit par un pont ou barrage
+> ouvrages avec un usage connu qui ne soit pas 'aucun' ou 'obsolète'
+
+## Préparation des données
+
+### Partie 1: Hauteurs de chute
+
+> ouvrages avec des classes de hauteur de chute renseignées
+
+```{r}
+data_height <- data_roe %>% 
+  filter(
+    etat_ouvrage == "Existant",
+    label_type_principal %in% c("Seuil en rivière", "Barrage", "Obstacle induit par un pont"), 
+    !label_usage %in% c("Aucun", "Obsolète", "Type d'usage inconnu"),
+    !is.na(code_chute),
+    code_chute != 0) %>% 
+  mutate(label_chute = fct_reorder(.f = label_chute, 
+                                   .x = as.numeric(code_chute))) %>% 
+  group_by(label_usage, label_chute) %>% 
+  summarise(nombre = n_distinct(code_obstacle)) %>% 
+  group_by(label_usage) %>% 
+  mutate(pourcentage = 100* nombre / sum(nombre),
+         chute = fct_relabel(
+           .f = label_chute, 
+           .fun = function(label) {
+             gsub(x = label, pattern = "DE ", replacement = "") %>% 
+               gsub(pattern = " A INFERIEURE A ", replacement = "-") %>% 
+               gsub(pattern = "INFERIEURE A", replacement = "<") %>% 
+               gsub(pattern = "SUPERIEURE OU EGALE A ", replacement = "> ") %>%
+               gsub(pattern = "m-", replacement = "-")
+             }),
+         usage = str_wrap(label_usage, width = 40)) %>% 
+  mutate(
+    L = case_when(
+      label_chute == 'INFERIEURE A 0,5m' ~ 0,
+      label_chute == 'DE 0,5m A INFERIEURE A 1m' ~ .5,
+      label_chute == 'DE 1m A INFERIEURE A 1,5m' ~ 1,
+      label_chute == 'DE 1,5m A INFERIEURE A 2m' ~ 1.5,
+      label_chute == 'DE 2m A INFERIEURE A 3m' ~ 2,
+      label_chute == 'DE 3m A INFERIEURE A 5m'~ 3,
+      label_chute == 'DE 5m A INFERIEURE A 10m'~ 5,
+      label_chute == 'SUPERIEURE OU EGALE A 10m' ~ 10
+    ),
+    H = case_when(
+      label_chute == 'INFERIEURE A 0,5m' ~ .5,
+      label_chute == 'DE 0,5m A INFERIEURE A 1m' ~ 1,
+      label_chute == 'DE 1m A INFERIEURE A 1,5m' ~ 1.5,
+      label_chute == 'DE 1,5m A INFERIEURE A 2m' ~ 2,
+      label_chute == 'DE 2m A INFERIEURE A 3m' ~ 3,
+      label_chute == 'DE 3m A INFERIEURE A 5m'~ 5,
+      label_chute == 'DE 5m A INFERIEURE A 10m'~ 10,
+      label_chute == 'SUPERIEURE OU EGALE A 10m' ~ 15
+    ),
+    chute = as.character(chute)) %>% 
+  ungroup()
+
+levels_usage <- group_by(data_height, label_usage) %>% 
+  group_modify(.f = function(df, ...) {
+    mutate(df, 
+           nb_cum = cumsum(nombre),
+           w = H - L,
+           nb_tot = sum(nombre)) %>% 
+      mutate(median_class = nb_cum > median(seq(max(nb_cum)))) %>% 
+      mutate(B = max(c(0, max(nb_cum[!median_class])))) %>% 
+      mutate(median_class = median_class & nb_cum == min(nb_cum[median_class])) %>% 
+      filter(median_class) %>% 
+      mutate(median_value = L + w * ((nb_tot / 2) - B) / nombre) %>% 
+      select(label_chute, median_value)
+  }) %>% 
+  ungroup() %>% 
+  mutate(label_usage = fct_reorder(label_usage, median_value, .desc = TRUE)) %>% 
+  arrange(label_usage) %>% 
+  rename(median_class = label_chute)
+  
+data_height <- mutate(data_height, 
+                      label_usage = fct_relevel(label_usage, levels(levels_usage$label_usage))) %>% 
+  group_by(label_usage) %>% 
+  mutate(nombre_total = paste0("(n = ", format(sum(nombre), big.mark = " "), ")")) %>% 
+  ungroup() %>% 
+  left_join(select(levels_usage, label_usage, median_class), by = "label_usage") %>% 
+  mutate(median_class = label_chute == median_class,
+         x = (L + H) / 2,
+         width = H - L) %>% 
+  select(label_usage, chute, 
+         y = x, height = width, median_class,
+         nombre, pourcentage) %>%
+  mutate(x0 = 0 - pourcentage/2,
+         x1 = 0 + pourcentage/2, 
+         y0 = y - height/2,
+         y1 = y + height/2)
+```
+
+### Partie 2: Taux de renseignement
+
+```{r}
+data_icons_usage <- data_roe %>% 
+  filter(etat_ouvrage == "Existant",
+         label_type_principal %in% c("Seuil en rivière", "Barrage", "Obstacle induit par un pont"),
+         !label_usage %in% c("Aucun", "Obsolète", "Type d'usage inconnu")) %>%
+  group_by(code_usage, label_usage) %>% 
+  summarise(oui = sum(!is.na(code_chute) & code_chute != 0),
+            non = sum(is.na(code_chute) |  code_chute == 0)) %>% 
+  gather(-ends_with("usage"), key = renseignement, value = nombre) %>% 
+  mutate(source = case_when(
+    label_usage == "Loisirs et sports aquatiques" ~ 
+      file.path(wd, "img/swimmer-solid.png"),
+    label_usage == "Energie et hydroélectricité" ~ 
+      file.path(wd, "img/bolt-solid.png"),
+    label_usage == "Stabilisation du profil en long du lit, lutte contre l'érosion" ~ 
+      file.path(wd, "img/water-solid.png"),
+    label_usage == "Transports et soutien de navigation" ~ 
+      file.path(wd, "img/ship-solid.png"),
+    label_usage == "Agriculture (irrigation, abreuvage)" ~
+      file.path(wd, "img/tractor-solid.png"),
+    label_usage == "Sécurité des biens et des personnes" ~
+      file.path(wd, "img/user-shield-solid.png"),
+    label_usage == "Suivi technique et scientifique (débit, température)" ~
+      file.path(wd, "img/thermometer-half-solid.png"),
+    label_usage == "Industrie" ~ 
+      file.path(wd, "img/industry-solid.png"),
+    label_usage == "Activités aquacoles" ~ 
+      file.path(wd, "img/fish-solid.png"),
+    label_usage == "Alimentation en eau potable" ~ 
+      file.path(wd, "img/shower-solid.png")
+  )) %>% 
+  group_by(label_usage) %>% 
+  mutate(nombre_total = sum(nombre)) %>% 
+  ungroup() %>% 
+  mutate(label_usage = fct_relevel(label_usage, levels(levels_usage$label_usage))) %>% 
+  arrange(label_usage) %>% 
+  mutate(label = paste0("<em>", label_usage, "</em><br><i>", if_else(renseignement == "oui", "", "non "), "renseigné</i><br>Nombre d'obstacle: ", format(nombre, big.mark = " "), " (", round(100 * nombre / nombre_total), "%)"))
+
+```
+
+## Figure
+
+### Partie 1: Hauteurs de chute
+```{r}
+hauteurs <- split(data_height, data_height$label_usage) %>% 
+  lapply(function(df) {
+    
+    if (unique(df$label_usage) == levels_usage$label_usage[10]) {
+      legend <- 
+        list(
+          list(
+            text = "Pourcentage<br>d'obstacles:",
+            x = -28, xref = "x", xanchor = "left",
+            y = 15, yref = "y", yanchor = "top",
+            showarrow = FALSE, align = "left"
+          ),
+          list(
+            text = "5%",
+            x = 25, xref = "x", xanchor = "right",
+            y = 13, yref = "y", yanchor = "center",
+            showarrow = FALSE
+          ),
+          list(
+            text = "10%",
+            x = 25, xref = "x", xanchor = "right",
+            y = 12.5, yref = "y", yanchor = "center",
+            showarrow = FALSE
+          ),
+          list(
+            text = "20%",
+            x = 25, xref = "x", xanchor = "right",
+            y = 12, yref = "y", yanchor = "center",
+            showarrow = FALSE
+          )
+      )
+    } else {
+      legend <- list(
+        list(
+          text = "", showarrow = FALSE
+        )
+      )
+    }
+    
+    plot_ly(data = df) %>% 
+      add_markers(x = 0, 
+                  y = ~y,
+                  text = paste0(
+                    "<em>", df$label_usage, "</em><br>",
+                    "<i>Hauteur de chute: ", df$chute, "</i><br>",
+                    "Obstacles: ", round(df$pourcentage, 2), "%",
+                    " (n = ", format(df$nombre, big.mark = " "), ")"),
+                  hoverinfo = "text",
+                  marker = list(
+                    color = "transparent"
+                  )
+      ) %>% 
+      layout(shapes = lapply(split(df, 
+                                   df$chute),
+                             function(df.i) {
+                               list(
+                                 type = "rect",
+                                 fillcolor = if_else(df.i$median_class, 
+                                                     "#1874CD", 
+                                                     grey(.25)),
+                                 line = list(color = "transparent"),
+                                 x0 = df.i$x0,
+                                 x1 = df.i$x1,
+                                 y0 = df.i$y0,
+                                 y1 = df.i$y1
+                               )
+                             }) %>% 
+               (function(x) {
+                 if (unique(df$label_usage) == levels_usage$label_usage[10]) {
+                   x[[length(x) + 1]] <- list(
+                     type = "rect",
+                     fillcolor = "white",
+                     line = list(color = grey(.75)),
+                     x0 = -29, x1 = 29,
+                     y0 = 11.5, y1 = 15
+                   )
+                   
+                   x[[length(x) + 1]] <- list(
+                     type = "rect",
+                     fillcolor = grey(.25),
+                     line = list(color = "transparent"),
+                     x0 = -12.5, x1 = -7.5,
+                     y0 = 12.9, y1 = 13.1
+                   )
+
+                   x[[length(x) + 1]] <- list(
+                     type = "rect",
+                     fillcolor = grey(.25),
+                     line = list(color = "transparent"),
+                     x0 = -15, x1 = -5,
+                     y0 = 12.4, y1 = 12.6
+                   )
+                   
+                   x[[length(x) + 1]] <- list(
+                     type = "rect",
+                     fillcolor = grey(.25),
+                     line = list(color = "transparent"),
+                     x0 = -20, x1 = 0,
+                     y0 = 11.9, y1 = 12.1
+                   )
+
+                 }
+
+                 names(x) <- NULL
+                 
+                 x
+               }),
+             annotations = legend,
+             xaxis = list(range = c(-30, 30),
+                          showgrid = FALSE,
+                          showticklabels = FALSE),
+             yaxis = list(title = "",
+                          range = range(c(df$y0, df$y1)),
+                          tickvals = c(0, 1, 3, 5, 10),
+                          zeroline = FALSE))
+  }) %>% 
+  subplot(shareY = TRUE, margin = 0) %>% 
+  add_annotations(
+    text = "Classe de hauteur<br>de chute (m)",
+    x = -.05, xref = "paper", xanchor = "left",
+    y = 1, yref = "paper", yanchor = "bottom",
+    align = "left", showarrow = FALSE
+  ) %>% 
+  layout(margin = list(t = 0, r = 0, l = 0, b = 0))
+```
+
+### Partie 2: Taux de renseignement
+```{r}
+conv_img_to_text <- function(x) {
+  paste('data:image/png;base64',
+        RCurl::base64Encode(readBin(x, "raw", file.info(x)[1, "size"]), "txt"),
+        sep = ",")
+}
+
+```
+
+```{r}
+icons <- lapply(split(data_icons_usage, 
+                      data_icons_usage$label_usage), 
+                function(df) {
+                  p <- 20
+                  
+                  transx <- function(x, p, i) {
+                    case_when(
+                      i == 1  ~ mean((x + p/2) / (1 + p)) + .02,
+                      i == 2  ~ mean((x + p/2) / (1 + p)) + .015,
+                      i == 9  ~ mean((x + p/2) / (1 + p)) - .015,
+                      i == 10 ~ mean((x + p/2) / (1 + p)) - .02,
+                      TRUE ~ mean((x + p/2) / (1 + p))
+                    )
+
+                    }
+                  
+                  i <- as.numeric(df$label_usage)[1]
+                  x <- c((i - 1)/10, i / 10)
+                  y <- c(0, .1)
+                  
+                  plot_ly(data = df) %>% 
+                    add_pie(
+                      labels = ~renseignement, 
+                      values = ~nombre, 
+                      name = ~label_usage,
+                      hole = .7, 
+                      textinfo = 'none',
+                      text = ~label, 
+                      hoverinfo = "text", 
+                      showlegend = FALSE,
+                      domain = list(x = x,
+                                    y = y)) %>% 
+                    layout(colorway = grey(c(.25, .75)),
+                           images = list(
+                             source = conv_img_to_text(df$source[1]),
+                             x = transx(x, p, i), xref = "paper", xanchor = "center",
+                             y = .6 ,yref = "paper", yanchor = "center",
+                             sizex = .4, sizey = .4, sizing = "contain"
+                           ),
+                           xaxis = list(
+                             title = "",
+                             zeroline = FALSE,
+                             showline = FALSE,
+                             showticklabels = FALSE,
+                             showgrid = FALSE
+                           ),
+                           yaxis = list(
+                             title = "",
+                             zeroline = FALSE,
+                             showline = FALSE,
+                             showticklabels = FALSE,
+                             showgrid = FALSE
+                           )
+                    )
+                }) %>% 
+  subplot(margin = 0) %>% 
+  layout(margin = list(t = 0, r = 0, b = 0, l = 0))
+```
+
+### Figure complète
+```{r}
+subplot(hauteurs, icons, 
+        nrows = 2, heights = c(.85, .15), shareX = FALSE) %>%
+    add_annotations(
+    text = "<i>non renseigné</i>",
+    x = -.075, xref = "paper", xanchor = "left",
+    y = .075, yref = "paper", yanchor = "bottom",
+    showarrow = FALSE
+  ) %>% 
+  add_annotations(
+    text = "<i>renseigné</i>",
+    x = -.07, xref = "paper", xanchor = "left",
+    y = 0, yref = "paper", yanchor = "center",
+    showarrow = FALSE
+  ) %>% 
+  add_annotations(
+    text = "<i>classe médiane de<br>hauteur de chute</i>",
+    x = .075, xref = "paper", xanchor = "left", ax = 15,
+    y = .33, yref = "paper", yanchor = "center", ay = -50,
+    bgcolor = "#1874CD", font = list(color = "white", face = "bold"),
+    showarrow = TRUE) %>% 
+  hide_guides() %>% 
+  layout(margin = list(t = 50, b = 20, l = 100),
+         plot_bgcolor = 'transparent',
+         paper_bgcolor = 'transparent') %>% 
+  api_create("roe_05_hauteurs_usages")
+```
+
+# Figure 6: Dispositifs de franchissement
+
+> ouvrages validés
+> ouvrages existants
+> ouvrages de type seuil en rivière, obstacle induit par un pont ou barrage
+> ouvrages avec des classes de hauteur de chute renseignées
+
+## Préparation des données
+
+### Partie 1: Types de dispositifs
+
+```{r}
+data_dispo <- data_roe %>% 
+  filter(etat_ouvrage == "Existant",
+         label_type_principal %in% 
+           c("Seuil en rivière", "Barrage", "Obstacle induit par un pont"),
+         !is.na(code_chute) & code_chute != 0) %>% 
+  mutate(
+    chute = fct_relabel(
+      .f = label_chute, 
+      .fun = function(label) {
+        gsub(x = label, pattern = "DE ", replacement = "") %>% 
+          gsub(pattern = " A INFERIEURE A ", replacement = "-") %>% 
+          gsub(pattern = "INFERIEURE A", replacement = "<") %>% 
+          gsub(pattern = "SUPERIEURE OU EGALE A ", replacement = "> ") %>% 
+          gsub(pattern = "m-", replacement = "-")
+        })
+    ) %>% 
+  mutate(label_dispo = case_when(
+    label_dispo == "Absence d'information" ~ NA_character_,
+    label_dispo == "Type de dispositif (piscicole) inconnu" ~ "Inconnu",
+    TRUE ~ label_dispo)) %>% 
+  group_by(code_chute, chute) %>% 
+  mutate(nombre_non_renseigne = n_distinct(code_obstacle[is.na(label_dispo)]),
+         nombre_non_equipe = n_distinct(code_obstacle[!is.na(label_dispo) & label_dispo == "Absence de passe"]),
+         nombre_equipe = n_distinct(code_obstacle[!is.na(label_dispo) & label_dispo != "Absence de passe"])) %>% 
+  filter(!is.na(label_dispo), label_dispo != "Absence de passe") %>% 
+  group_by(chute, label_dispo, nombre_non_renseigne, nombre_non_equipe, nombre_equipe) %>% 
+  mutate(nombre = n_distinct(code_obstacle)) %>%
+  ungroup() %>% 
+  group_by(label_dispo) %>% 
+  mutate(nombre_total = n_distinct(code_obstacle)) %>% 
+  mutate(proportion = nombre / nombre_total) %>% 
+  ungroup() %>% 
+  mutate(hoverText = paste0("<em>", label_dispo, "</em><br><i>Hauteur de chute: ", chute, "</i><br>Nombre: ", nombre, " (", round(proportion * 100), "%)")) 
+
+levels_dispo <- group_by(data_dispo, label_dispo) %>% 
+  summarise(mean_height = mean(as.numeric(code_chute), na.rm = TRUE)) %>% 
+  arrange(desc(mean_height)) %>% 
+  pull(label_dispo)
+
+data_dispo <- mutate(data_dispo,
+                     label_dispo = fct_relevel(label_dispo, levels_dispo)) %>% 
+  mutate(chute = fct_reorder(.f = chute, .x = as.numeric(code_chute))) %>%
+  select(chute, nombre_non_renseigne, nombre_non_equipe, nombre_equipe, label_dispo, nombre, nombre_total, proportion, hoverText) %>% 
+  distinct() %>% 
+  mutate(pourcentage = round(100 * proportion))
+```
+
+### Partie 2: Taux d'équipement
+```{r}
+data_donuts <- select(data_dispo, chute, nombre_non_renseigne, nombre_non_equipe, nombre_equipe) %>% 
+  distinct() %>%
+  gather(key = category, value = number, -chute) %>% 
+  mutate(category = case_when(
+    category == "nombre_non_renseigne" ~ "non renseigné",
+    category == "nombre_non_equipe" ~ "non équipé",
+    category == "nombre_equipe" ~ "équipé"
+  ),
+  chute = fct_drop(chute)) %>% 
+  group_by(chute) %>% 
+  mutate(total_number = sum(number)) %>% 
+  ungroup() %>% 
+  mutate(label = paste0("<em>Hauteur de chute: ", chute, "</em><br><i>", category, "</i><br>Nombre d'obstacle: ", number, " (", round(100 * number / total_number), "%)"))
+```
+
+## Figure
+
+### Partie 1: Types de dispositifs
+```{r}
+all_points <- map(.x = seq(nrow(data_dispo)),
+                  .f = function(i) {
+                    sample_n(tbl = slice(data_dispo, i) %>% 
+                               select(label_dispo, chute, pourcentage),
+                             size = slice(data_dispo, i) %>% 
+                               pull(pourcentage),
+                             replace = TRUE)
+                  }) %>% 
+  bind_rows()
+
+all_points <- (ggplot(all_points) +
+                 geom_point(aes(x = label_dispo, y = chute, text = paste0(label_dispo, "_", chute)), 
+                            position = position_surround(), size = .1)) %>% 
+  ggplot_build() %>% 
+  (function(x) x$data[[1]]) %>% 
+  separate(col = "text", into = c("label_dispo", "chute"), sep = "_") %>% 
+  select(x, y, label_dispo, chute) %>% 
+  left_join(x = ., y = select(data_dispo, label_dispo, chute, nombre, pourcentage),
+            by = c("label_dispo", "chute")) %>% 
+  mutate(hoverText = paste0("<em>", label_dispo, "</em><br><i>Hauteur de chute: ", chute, "</i><br>Dispositifs: ", pourcentage, "% (n = ", nombre, ")"),
+         colorPoint = label_dispo == "Inconnu")
+
+dispositifs <- plot_ly(data = all_points) %>% 
+  add_markers(x = ~x, y = ~y, marker = list(size = 3),
+              color = ~colorPoint,
+              colors = c("#1874CD", grey(.75)),
+              text = ~hoverText,
+              hoverinfo = "text") %>% 
+  layout(xaxis = list(title = "", 
+                      ticktext = as.list(levels(data_dispo$label_dispo)),
+                      tickvals = as.list(seq(length(levels(data_dispo$label_dispo)))),
+                      showticklabels = TRUE,
+                      zeroline = FALSE,
+                      showgrid = FALSE),
+         yaxis = list(title = "",
+                      ticktext = as.list(levels(data_dispo$chute)),
+                      tickvals = as.list(seq(length(levels(data_dispo$chute)))),
+                      showticklabels = TRUE,
+                      showgrid = FALSE),
+         margin = list(t = 0, r = 0, l = 0, b = 0))
+
+for (i in seq(.5, 11.5, by = 1)) {
+  dispositifs <- dispositifs %>% 
+    add_segments(x = i, xend = i, y = .5, yend = 8.5, line = list(color = grey(.75)), hoverinfo = "none") 
+}
+
+```
+
+
+### Partie 2: Taux d'équipement
+```{r}
+
+y_s <- tibble(start = c(6.1, 17.1, 28.1, 39.1, 50.1, 61.1, 72.1, 83.1) / 100,
+              end =   c(16.9, 27.9, 38.9, 49.9, 60.9, 71.9, 82.9, 93.9) / 100,
+              label = c("< 0,5", "0,5-1", "1-1,5", "1,5-2", "2-3", "3-5", "5-10", "> 10"),
+              y_lab = 1/16 * seq(8))
+
+donuts <- lapply(split(data_donuts, 
+                       data_donuts$chute), 
+                 function(df) {
+                   
+                   i <- as.numeric(df$chute)[1]
+                   x <- c(0, .1)
+                   y <- c(y_s$start[i], y_s$end[i])
+                   
+                   plot_ly(data = df) %>% 
+                     add_pie(
+                       labels = ~category, 
+                       values = ~number, 
+                       split = ~chute, 
+                       showlegend = FALSE,
+                       hole = .6, 
+                       textinfo = 'none',
+                       text = ~label,
+                       hoverinfo = "text",
+                       domain = list(x = x,
+                                     y = y)) %>% 
+                     layout(colorway = c(grey(c(.25, .75)), c("#1874CD")),
+                            xaxis = list(
+                              title = "",
+                              zeroline = FALSE,
+                              showline = FALSE,
+                              showticklabels = FALSE,
+                              showgrid = FALSE
+                            ),
+                            yaxis = list(
+                              title = "",
+                              zeroline = FALSE,
+                              showline = FALSE,
+                              showticklabels = FALSE,
+                              showgrid = FALSE
+                            )
+                     )
+                 }) %>% 
+  subplot(margin = 0) %>% 
+  layout(margin = list(t = 0, r = 0, b = 0, l = 0))
+
+
+```
+
+### Figure complète
+```{r}
+higher_device <- all_points %>% 
+  filter(x == min(x)) %>% 
+  pull(label_dispo) %>% 
+  unique() %>% 
+  tolower() %>% 
+  str_replace(pattern = "ecluse",
+              replacement = "écluse")
+
+subplot(donuts, dispositifs,
+        nrows = 1, widths = c(.175, .825)) %>% 
+  hide_guides() %>% 
+  layout(annotations = list(
+    list(x = .1, xref = "paper", xanchor = "left",
+         y = 1, yref = "paper", yanchor = "bottom",
+         text = "<i>Classe de hauteur<br>de chute</i>", showarrow = FALSE, align = "left"),
+    list(x = .03, xref = "paper", xanchor = "right", ax = -10,
+         y = .95, yref = "paper", yanchor = "bottom", ay = -10,
+         bgcolor = grey(.75), font = list(color = "white", face = "bold"),
+         text = "<i>non renseigné</i>",
+         showarrow = FALSE),
+    list(x = .01, xref = "paper", xanchor = "right", ax = -20,
+         y = .93, yref = "paper", yanchor = "center", ay = 0,
+         bgcolor = "#1874CD", font = list(color = "white", face = "bold"),
+         text = "<i>équipé</i>",
+         showarrow = FALSE),
+    list(x = .07, xref = "paper", xanchor = "left", ax = 10,
+         y = .92, yref = "paper", yanchor = "bottom", ay = -10,
+         bgcolor = grey(.25), font = list(color = "white", face = "bold"),
+         text = "<i>non équipé</i>", bgcolor = "white",
+         showarrow = FALSE),
+    list(x = .25, xref = "paper", xanchor = "left", ax = 20,
+         y = .955, yref = "paper", yanchor = "center", ay = -30,
+         text = paste0("<i>pourcentage d'obstacles ayant une hauteur de chute<br>supérieure à 10m et équipés d'", higher_device, "<br></i>"), 
+         bgcolor = "white", 
+         align = "left", font = list(color = "#1874CD"),
+         showarrow = TRUE)
+  ),
+  margin = list(t = 100, l = 100, b = 50),
+  plot_bgcolor = 'transparent',
+  paper_bgcolor = 'transparent') %>% 
+  api_create("roe_06_dispositifs_hauteurs")
+```

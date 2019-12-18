@@ -1,0 +1,92 @@
+---
+title: "Méthode"
+author: ""
+date: ""
+output: 
+  html_document:
+    css: style_methodo.css
+    encoding: UTF-8
+    includes:
+      in_header: myheader.html
+
+---
+
+# Origine des données
+
+Les données du Référentiel des Obstacles à l'Ecoulement (ROE) sont téléchargées sous un format de fichier spatialisé (*shapefile*) depuis [data.eaufrance.fr](https://services.sandre.eaufrance.fr/geo/obs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&typename=ObstEcoul_FXX&SRSNAME=EPSG:2154&OUTPUTFORMAT=SHAPEZIP) ou depuis [sandre.eaufrance.fr](http://www.sandre.eaufrance.fr/atlas/srv/fre/catalog.search;jsessionid=uve0qbc851mx1u4fqcwqin49y#/metadata/59057026-b40c-4cf9-9e3e-7296e0aa1a78). Ces données couvrent l'intégralité du territoire français (Métropole + Outre-Mer). Les données diffusées sont régulièrement mises à jour. L'export utilisé date du 19 novembre 2019. 
+
+# Contenu des données
+
+Parmi les informations diffusées, celles figurant dans la liste ci-dessous ont été utilisées pour produire les figures de cette dataviz:
+
+- Code unique de l'obstacle;
+- Statut de l'obstacle: validé ou non;
+- Date de validation;
+- Etat de l'ouvrage: existant, détruit partiellement, détruit totalement;
+- Type de l'ouvrage: type principal (seuil en rivière, obstacle induit par un pont, barrage, digue, grille de pisciculture, épis en rivière) et sous-type correspondant;
+- Type d'usage associé à l'ouvrage: e.g. énergie et hydroélectricité, agriculture, industrie;
+- Classe de hauteur de chute;
+- Type de dispositif de franchissement piscicole dont l'ouvrage est équipé.
+
+# Traitement des données
+
+## Date de validation des ouvrages
+Dans le cas où aucune date de validation n'est renseignée pour un ouvrage, nous lui avons attribué la plus ancienne date de validation parmi les données disponibles.
+
+## Typologie des ouvrages
+Afin de disposer d'une information hiérarchisée sur la typologie des ouvrages, nous avons utilisé les codes de type de ces ouvrages pour extraire le type principal en plus de l'éventuel sous-type pour chacun des ouvrages.
+
+## Nettoyage des données
+Du fait de la nature itérative du remplissage de la base de données, il est courant que certaines informations aient été remplies à plusieurs occasions dans le temps, sans mise à jour des informations pré-existantes mais en ajoutant de nouvelles informations. Ceci a pour conséquence des informations multiples dont certaines sont obsolètes. Afin de limiter les problèmes générés par ces pratiques, nous avons appliqué les règles suivantes:
+
+- si plusieurs types sont renseignés, dont  'type inconnu', on ne conserve pas le type 'inconnu';
+- si plusieurs usages sont renseignés, dont 'usage inconnu', on ne conserve pas l'usage inconnu;
+- si plusieurs usages sont renseignés, dont 'aucun usage' ET 'obsolète', on ne conserve que l'information 'obsolète';
+- si plusieurs usages sont renseignés, dont 'aucun usage' ou 'obsolète', on ne conserve que les usages les plus récents (aucun/obsolète ou les usages postérieurs à aucun/obsolète);
+- si plusieurs classes de hauteur de chute sont renseignées, dont 'inconnue', on ne conserve pas la classe 'inconnue';
+- si plusieurs dispositifs de franchissement sont renseignés, dont 'absence de passe', on ne conserve pas l'absence de passe';
+- si plusieurs dispositifs de franchissement sont renseignés, dont 'inconnu', on ne conserve pas le dispositif 'inconnu'.
+
+## Données utilisées pour chaque figure
+
+Les figures présentées dans cette dataviz repose chacune sur un jeu de données particulier, sélectionné pour être pertinent selon le propos que l'on souhaite illustrer. Les critères de sélection des ouvrages pour la construction de chacune des figures sont indiqués ci-dessous.
+
+### Le référentiel des obstacles à l’écoulement (ROE)
+
+- ouvrages validés
+
+### Typologie des obstacles existants
+
+- ouvrages validés;
+- ouvrages existants.
+
+### Usage des obstacles - diagramme Sunburst
+
+- ouvrages validés;
+- ouvrages existants;
+- ouvrages de type principal 'seuil en rivière', 'obstacle induit par un pont' ou 'barrage'.
+
+### Usage des obstacles - diagramme de Sankey
+
+- ouvrages validés;
+- ouvrages existants;
+- ouvrages de type principal 'seuil en rivière', 'obstacle induit par un pont' ou 'barrage';
+- ouvrage avec un usage connu.
+
+### Hauteur de chute selon les usages
+
+- ouvrages validés;
+- ouvrages existants;
+- ouvrages de type principal 'seuil en rivière', 'obstacle induit par un pont' ou 'barrage';
+- ouvrage avec un usage connu différent de 'aucun' ou 'obsolète'.
+
+### Dispositifs de franchissement piscicole
+
+- ouvrages validés;
+- ouvrages existants;
+- ouvrages de type principal 'seuil en rivière', 'obstacle induit par un pont' ou 'barrage';
+- ouvrage avec une classe de hauteur de chute renseignée
+
+# Conception
+
+L'ensemble des traitements ont été réalisés en utilisant le logiciel open source <a href="https://cran.r-project.org/" target="_blank"><img src="img/RStudio.png" height="14px"></a>. Les graphiques (excepté celui pour les types d'ouvrages, réalisé avec les packages `treemap` et `d3treeR`) ont été réalisés en utilisant la librairie <a href="https://plot.ly/r/" target="_blank">Plotly</a>.
